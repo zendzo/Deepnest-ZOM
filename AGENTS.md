@@ -60,7 +60,7 @@ Fork of Deepnest (Jack Qiao, GPLv3) maintained for ZOM. `README.md` is the upstr
 
 ## Workflow
 
-- One `feature/...` branch per feature; merge into `master` only after manual/browser verification.
+- One `feature/...` branch per feature; merge into `main` only after manual/browser verification.
 - Run `node tools/test-importers.js` and `tools/run-browser-tests.ps1` before merging. `tools/test-importers.js` uses `NC1_SAMPLE_DIR` or the default `~/OneDrive - Seatrium Ltd/Documents/SAMPLE_NC`; it skips reference checks if the folder is absent.
 
 ## Profiling import performance
