@@ -146,21 +146,35 @@
 	
 	// use the utility functions in this class to prepare the svg for CAD-CAM/nest related operations
 	SvgParser.prototype.cleanInput = function(dxfFlag){
+		var timing = root.DeepnestTiming || root.NoopDeepnestTiming || {
+			mark: function(){ return null; },
+			measure: function(){}
+		};
+		var stepStart = timing.mark();
 		
 		// apply any transformations, so that all path positions etc will be in the same coordinate space
 		this.applyTransform(this.svgRoot, '', false, dxfFlag);
+		timing.measure('clean.applyTransform', stepStart);
 
 		// remove any g elements and bring all elements to the top level
+		stepStart = timing.mark();
 		this.flatten(this.svgRoot);
+		timing.measure('clean.flatten', stepStart);
 		
 		// remove any non-geometric elements like text
+		stepStart = timing.mark();
 		this.filter(this.allowedElements);
-		
+		timing.measure('clean.filter', stepStart);
+
+		stepStart = timing.mark();
 		this.imagePaths(this.svgRoot);
+		timing.measure('clean.imagePaths', stepStart);
 		//console.log(this.svgRoot);
 		
 		// split any compound paths into individual path elements
+		stepStart = timing.mark();
 		this.recurse(this.svgRoot, this.splitPath);
+		timing.measure('clean.splitPath', stepStart);
 		//console.log(this.svgRoot);
 		
 		// this kills overlapping lines, but may have unexpected edge cases
@@ -171,6 +185,7 @@
 		
 		// merge open paths into closed paths
 		// for numerically accurate exports
+		stepStart = timing.mark();
 		this.mergeLines(this.svgRoot, this.conf.toleranceSvg);
 		
 		console.log('this is the scale ',this.conf.scale*(0.02), this.conf.endpointTolerance);	
@@ -179,6 +194,7 @@
 		this.mergeLines(this.svgRoot, this.conf.endpointTolerance);
 		// finally close any open paths with a really wide margin
 		this.mergeLines(this.svgRoot, 3*this.conf.endpointTolerance);	
+		timing.measure('clean.mergeLines', stepStart);
 		
 		
 		

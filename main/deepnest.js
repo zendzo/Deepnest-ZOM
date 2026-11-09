@@ -6,6 +6,212 @@
 (function(root){
 	'use strict';
 	
+	// ------------------------------------------------------------------
+	// Lightweight import/parse profiler.
+	//
+	// Disabled by default. Turn it on with any of:
+	//   localStorage.setItem('deepnest.timing', '1')   (persists)
+	//   ?timing=1 in the URL                           (browser mode)
+	//   DeepnestTiming.enable()                        (current session)
+	//
+	// A batch summary is printed to the console when an import finishes and
+	// the last summary is exposed as window.__deepnestImportProfile.
+	// ------------------------------------------------------------------
+	function Timing(){
+		this.enabled = false;
+		this.samples = {};
+		this.order = [];
+		this.batch = null;
+	}
+	Timing.prototype.now = function(){
+		if(root.performance && root.performance.now){
+			return root.performance.now();
+		}
+		return Date.now();
+	};
+	Timing.prototype.setEnabled = function(on){
+		this.enabled = !!on;
+		return this.enabled;
+	};
+	Timing.prototype.enable = function(){
+		this.setEnabled(true);
+		try{
+			if(root.localStorage){
+				root.localStorage.setItem('deepnest.timing', '1');
+			}
+		}
+		catch(e){}
+		return true;
+	};
+	Timing.prototype.disable = function(){
+		this.setEnabled(false);
+		try{
+			if(root.localStorage){
+				root.localStorage.removeItem('deepnest.timing');
+			}
+		}
+		catch(e){}
+		return false;
+	};
+	Timing.prototype.mark = function(){
+		if(!this.enabled){
+			return null;
+		}
+		return this.now();
+	};
+	Timing.prototype.record = function(name, ms){
+		if(!this.enabled || typeof ms !== 'number' || !isFinite(ms)){
+			return;
+		}
+		var sample = this.samples[name];
+		if(!sample){
+			sample = this.samples[name] = {count: 0, total: 0, min: null, max: 0};
+			this.order.push(name);
+		}
+		sample.count++;
+		sample.total += ms;
+		if(sample.min === null || ms < sample.min){
+			sample.min = ms;
+		}
+		if(ms > sample.max){
+			sample.max = ms;
+		}
+	};
+	Timing.prototype.measure = function(name, start){
+		if(!this.enabled || start === null || typeof start === 'undefined'){
+			return;
+		}
+		var ms = this.now() - start;
+		this.record(name, ms);
+		return ms;
+	};
+	Timing.prototype.reset = function(){
+		this.samples = {};
+		this.order = [];
+	};
+	Timing.prototype.beginBatch = function(label, total){
+		if(!this.enabled){
+			this.batch = null;
+			return;
+		}
+		this.reset();
+		this.batch = {
+			label: label,
+			total: total,
+			start: this.now(),
+			files: [],
+			failures: 0
+		};
+	};
+	Timing.prototype.recordFile = function(name, ms, ok){
+		if(!this.enabled || !this.batch){
+			return;
+		}
+		this.batch.files.push({name: name, ms: ms, ok: ok !== false});
+		if(ok === false){
+			this.batch.failures++;
+		}
+	};
+	Timing.prototype.summary = function(){
+		var out = {
+			label: null,
+			total: 0,
+			files: 0,
+			failures: 0,
+			stages: [],
+			slowest: []
+		};
+		if(this.batch){
+			out.label = this.batch.label;
+			out.total = this.now() - this.batch.start;
+			out.files = this.batch.files.length;
+			out.failures = this.batch.failures;
+			var sorted = this.batch.files.slice(0).sort(function(a, b){
+				return b.ms - a.ms;
+			});
+			out.slowest = sorted.slice(0, 10);
+		}
+		for(var i=0; i<this.order.length; i++){
+			var name = this.order[i];
+			var sample = this.samples[name];
+			out.stages.push({
+				name: name,
+				count: sample.count,
+				total: sample.total,
+				avg: sample.total / sample.count,
+				min: sample.min,
+				max: sample.max
+			});
+		}
+		out.stages.sort(function(a, b){
+			return b.total - a.total;
+		});
+		return out;
+	};
+	Timing.prototype.print = function(summary){
+		if(typeof console === 'undefined'){
+			return;
+		}
+		summary = summary || this.summary();
+		var pad = function(value, width){
+			value = String(value);
+			while(value.length < width){
+				value += ' ';
+			}
+			return value;
+		};
+		console.log('[deepnest timing] ' + (summary.label || 'batch') + ': ' +
+			summary.total.toFixed(1) + ' ms, ' + summary.files + ' file(s)' +
+			(summary.failures ? ', ' + summary.failures + ' failed' : ''));
+		console.log('  ' + pad('stage', 26) + pad('n', 5) + pad('total ms', 11) + pad('avg ms', 10) + pad('max ms', 10));
+		for(var i=0; i<summary.stages.length; i++){
+			var stage = summary.stages[i];
+			console.log('  ' + pad(stage.name, 26) + pad(stage.count, 5) +
+				pad(stage.total.toFixed(1), 11) + pad(stage.avg.toFixed(1), 10) +
+				pad(stage.max.toFixed(1), 10));
+		}
+		if(summary.slowest.length > 0){
+			console.log('  slowest files:');
+			for(i=0; i<summary.slowest.length; i++){
+				var file = summary.slowest[i];
+				console.log('    ' + pad(file.name, 34) + file.ms.toFixed(1) + ' ms' +
+					(file.ok ? '' : ' (failed)'));
+			}
+		}
+	};
+	Timing.prototype.endBatch = function(){
+		if(!this.enabled){
+			return null;
+		}
+		var summary = this.summary();
+		this.print(summary);
+		root.__deepnestImportProfile = summary;
+		this.batch = null;
+		return summary;
+	};
+
+	root.DeepnestTiming = new Timing();
+	root.NoopDeepnestTiming = {
+		mark: function(){ return null; },
+		measure: function(){},
+		record: function(){},
+		beginBatch: function(){},
+		recordFile: function(){},
+		endBatch: function(){ return null; },
+		now: function(){ return Date.now(); },
+		enabled: false
+	};
+	try{
+		var timingQuery = (root.location && root.location.search) ? root.location.search : '';
+		if(/[?&]timing=1(?:&|$)/.test(timingQuery)){
+			root.DeepnestTiming.setEnabled(true);
+		}
+		else if(root.localStorage && root.localStorage.getItem('deepnest.timing') === '1'){
+			root.DeepnestTiming.setEnabled(true);
+		}
+	}
+	catch(e){}
+	
 	const { ipcRenderer } = require('electron');
 	const path = require('path')
 	const url = require('url')
@@ -16,6 +222,12 @@
 		var self = this;
 		
 		var svg = null;
+
+		var detectedCores = (root.navigator && root.navigator.hardwareConcurrency) ?
+			parseInt(root.navigator.hardwareConcurrency, 10) : 4;
+		if(!(detectedCores > 0)){
+			detectedCores = 4;
+		}
 		
 		var config = {
 			clipperScale: 10000000,
@@ -24,7 +236,7 @@
 			rotations: 4,
 			populationSize: 10,
 			mutationRate: 10,
-			threads: 4,
+			threads: Math.min(detectedCores, 8),
 			placementType: 'gravity',
 			mergeLines: true,
 			timeRatio: 0.5,
@@ -55,23 +267,124 @@
 		// a running list of placements
 		this.nests = [];
 		
-		this.importsvg = function(filename, dirpath, svgstring, scalingFactor, dxfFlag){
+		// Max parts that get an on-canvas label / thumbnail. Keeps huge sheets
+		// responsive; marks are still editable and exported for every part.
+		var MAX_LABELLED_PARTS = 100;
+		var MAX_THUMBNAILS = 300;
+
+		function createPartLabel(part, svgRoot){
+			if(!part || !part.bounds || !svgRoot){
+				return null;
+			}
+			var doc = svgRoot.ownerDocument || root.document;
+			if(!doc){
+				return null;
+			}
+			var width = part.bounds.width;
+			var height = part.bounds.height;
+			var fontSize = Math.min(width, height) * 0.12;
+			if(!(fontSize > 0)){
+				fontSize = Math.max(width, height) * 0.05;
+			}
+			if(!(fontSize > 0)){
+				return null;
+			}
+			var text = doc.createElementNS('http://www.w3.org/2000/svg', 'text');
+			text.setAttribute('x', part.bounds.x + width/2);
+			text.setAttribute('y', part.bounds.y + height/2);
+			text.setAttribute('text-anchor', 'middle');
+			text.setAttribute('dominant-baseline', 'middle');
+			text.setAttribute('class', 'part-label');
+			text.setAttribute('font-size', fontSize);
+			text.textContent = part.mark;
+			svgRoot.appendChild(text);
+			return text;
+		}
+
+		function createPartThumbnail(part){
+			var doc = root.document;
+			if(!doc || !part || !part.bounds || !part.svgelements){
+				return null;
+			}
+			var svg = doc.createElementNS('http://www.w3.org/2000/svg', 'svg');
+			svg.setAttribute('width', (part.bounds.width+10)+'px');
+			svg.setAttribute('height', (part.bounds.height+10)+'px');
+			svg.setAttribute('viewBox', (part.bounds.x-5)+' '+(part.bounds.y-5)+' '+(part.bounds.width+10)+' '+(part.bounds.height+10));
+			for(var i=0; i<part.svgelements.length; i++){
+				svg.appendChild(part.svgelements[i].cloneNode(false));
+			}
+			var serializer = root.XMLSerializer ? new root.XMLSerializer() : new XMLSerializer();
+			return serializer.serializeToString(svg);
+		}
+
+		this.importsvg = function(filename, dirpath, svgstring, scalingFactor, dxfFlag, meta){
+			var timing = root.DeepnestTiming || root.NoopDeepnestTiming;
+			var importStart = timing.mark();
 			// parse svg
 			// config.scale is the default scale, and may not be applied
 			// scalingFactor is an absolute scaling that must be applied regardless of input svg contents
+			var loadStart = timing.mark();
 			svg = SvgParser.load(dirpath, svgstring, config.scale, scalingFactor);
+			timing.measure('svgparser.load', loadStart);
+
+			var cleanStart = timing.mark();
 			svg = SvgParser.clean(dxfFlag);
-			
+			timing.measure('svgparser.clean', cleanStart);
+
+			var importRecord = null;
 			if(filename){
-				this.imports.push({
+				importRecord = {
 					filename: filename,
-					svg: svg
-				});
+					svg: svg,
+					meta: meta || null,
+					mark: null,
+					label: filename,
+					// Serialized lazily by the preview, which keeps only a
+					// small LRU of strings for large batches.
+					svgString: null
+				};
+				this.imports.push(importRecord);
 			}
 			
+			var getPartsStart = timing.mark();
 			var parts = this.getParts(svg.children);
+			timing.measure('deepnest.getParts', getPartsStart);
+			var fallbackMark = filename ? filename.replace(/\.[^.]+$/, '') : null;
+			var labelParts = !!importRecord && parts.length <= MAX_LABELLED_PARTS;
 			for(var i=0; i<parts.length; i++){
-				this.parts.push(parts[i]);
+				var part = parts[i];
+				// Part metadata comes from a local DXF TEXT scan or the NC1 header.
+				// For plain SVG, the filename is the most useful default.
+				part.mark = (meta && meta.mark) || fallbackMark || ('Part ' + (this.parts.length + 1));
+				part.name = part.mark;
+				part.sourceFile = filename || null;
+				part.meta = meta || null;
+
+				// One file = one part in the Tekla/NC1 workflow. Only apply the
+				// header quantity when the import really produced one part.
+				if(meta && meta.quantity && parts.length === 1){
+					part.quantity = meta.quantity;
+				}
+
+				// Preview-only label. Exports clone part.svgelements, so the
+				// label never reaches DXF/SVG output.
+				if(labelParts){
+					part.labelElement = createPartLabel(part, svg);
+				}
+
+				if(this.parts.length < MAX_THUMBNAILS){
+					part.thumbnail = createPartThumbnail(part);
+				}
+				else{
+					part.thumbnail = null;
+				}
+
+				this.parts.push(part);
+			}
+
+			if(importRecord){
+				importRecord.mark = (parts.length === 1) ? parts[0].mark : (fallbackMark || filename);
+				importRecord.label = importRecord.mark || filename;
 			}
 			
 			// test simplification
@@ -88,6 +401,8 @@
 				}
 				//this.renderPolygon(simple.exterior, svg, 'error');
 			}*/
+
+			timing.measure('importsvg.total', importStart);
 		}
 		
 		// debug function

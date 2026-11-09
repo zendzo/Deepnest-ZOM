@@ -20,6 +20,9 @@
 		
 		<script src="svgparser.js"></script>
 		<script src="deepnest.js"></script>
+		<script src="importer/dxf-meta.js"></script>
+		<script src="importer/nc1.js"></script>
+		<script src="exporter/dxf-labels.js"></script>
 
 		<script>
 		// UI-specific stuff in this script
@@ -68,6 +71,13 @@
 			// config form
 			const config = require('electron-settings');
 			window.config = config;
+
+			// Use the detected core count as the first-run default instead of
+			// a hardcoded 4. DeepNest clamps it to 8 as well.
+			var detectedCores = (navigator.hardwareConcurrency && navigator.hardwareConcurrency > 0) ?
+				navigator.hardwareConcurrency : 4;
+			detectedCores = Math.max(1, Math.min(detectedCores, 8));
+			window.__deepnestDetectedCores = detectedCores;
 			
 			var defaultconfig = {
 			  units: 'inch',
@@ -75,11 +85,12 @@
 			  spacing: 0,
 			  curveTolerance: 0.72, // store distances in native units
 			  rotations: 4,
-			  threads: 4,
+			  threads: detectedCores,
 			  populationSize: 10,
 			  mutationRate: 10,
 			  placementType: 'box', // how to place each part (possible values gravity, box, convexhull)
 			  mergeLines: true, // whether to merge lines
+			  partMarks: true, // include the part mark/name in SVG/DXF exports
 			  timeRatio: 0.5, // ratio of material reduction to laser time. 0 = optimize material only, 1 = optimize laser time only
 			  simplify: false,
 			  dxfImportScale: "1",
@@ -118,7 +129,7 @@
 						}
 					}
 					
-					if(key == 'mergeLines' || key == 'simplify'){
+					if(key == 'mergeLines' || key == 'simplify' || key == 'partMarks'){
 						val = i.checked;
 					}
 					
@@ -204,7 +215,7 @@
 					else if(i.getAttribute('data-conversion') == 'true'){
 						i.value = c[i.getAttribute('data-config')]/scale.value;
 					}
-					else if(key == 'mergeLines' || key == 'simplify'){
+					else if(key == 'mergeLines' || key == 'simplify' || key == 'partMarks'){
 						i.checked = c[i.getAttribute('data-config')];
 					}
 					else{
@@ -280,6 +291,9 @@
 				data: {
 					parts: DeepNest.parts,
 					imports: DeepNest.imports,
+					selectedIndex: -1,
+					importStatus: '',
+					importBusy: false,
 					getSelected: function(){
 						var parts = this.get('parts');
 						return parts.filter(function(p){
@@ -385,89 +399,257 @@
 				}
 			});
 			
-			// applies svg zoom library to the currently visible import
-			applyzoom = function(){
-				if(DeepNest.imports.length > 0){
-					for(var i=0; i<DeepNest.imports.length; i++){
-						if(DeepNest.imports[i].selected){
-							if(DeepNest.imports[i].zoom){
-								var pan = DeepNest.imports[i].zoom.getPan();
-								var zoom = DeepNest.imports[i].zoom.getZoom();
-							}
-							else{
-								var pan = false;
-								var zoom = false;
-							}
-							DeepNest.imports[i].zoom = svgPanZoom('#import-'+i+' svg', {
-								  zoomEnabled: true,
-								  controlIconsEnabled: false,
-								  fit: true,
-								  center: true,
-								  maxZoom: 50,
-								  minZoom: 0.1
-							});
-							
-							if(zoom){
-								DeepNest.imports[i].zoom.zoom(zoom);
-							}
-							if(pan){
-								DeepNest.imports[i].zoom.pan(pan);
-							}
-							
-							document.querySelector('#import-'+i+' .zoomin').addEventListener('click', function(ev){
-							  ev.preventDefault();
-							  DeepNest.imports.find(function(e){
-							  	return e.selected;
-							  }).zoom.zoomIn();
-							});
-							document.querySelector('#import-'+i+' .zoomout').addEventListener('click', function(ev){
-							  ev.preventDefault();
-							  DeepNest.imports.find(function(e){
-							  	return e.selected;
-							  }).zoom.zoomOut();
-							});
-							document.querySelector('#import-'+i+' .zoomreset').addEventListener('click', function(ev){
-							  ev.preventDefault();
-							  DeepNest.imports.find(function(e){
-							  	return e.selected;
-							  }).zoom.resetZoom().resetPan();
-							});
+			// ------------------------------------------------------------------
+			// Import preview
+			//
+			// Only the selected import is rendered. Its SVG string is cached
+			// lazily with a small LRU, so a large batch does not keep every
+			// serialized document alive at once.
+			// ------------------------------------------------------------------
+			var previewIndex = -1;
+			var previewZoom = null;
+			var previewStringOrder = [];
+			var PREVIEW_STRING_CACHE = 2;
+
+			function serializeImport(im){
+				if(!im || !im.svg){
+					return '';
+				}
+				if(typeof im.svgString === 'string'){
+					return im.svgString;
+				}
+				try{
+					im.svgString = (new XMLSerializer()).serializeToString(im.svg);
+				}
+				catch(e){
+					console.warn('Could not serialize import preview', e);
+					im.svgString = '';
+				}
+				previewStringOrder.push(im);
+				while(previewStringOrder.length > PREVIEW_STRING_CACHE){
+					var old = previewStringOrder.shift();
+					if(old && old !== im){
+						old.svgString = null;
+					}
+				}
+				return im.svgString;
+			}
+
+			function selectedImportIndex(){
+				for(var i=0; i<DeepNest.imports.length; i++){
+					if(DeepNest.imports[i].selected){
+						return i;
+					}
+				}
+				return -1;
+			}
+
+			function destroyPreviewZoom(){
+				if(previewZoom){
+					try{
+						previewZoom.destroy();
+					}
+					catch(e){}
+					previewZoom = null;
+				}
+			}
+
+			function savePreviewZoom(){
+				if(previewZoom && previewIndex >= 0 && DeepNest.imports[previewIndex]){
+					DeepNest.imports[previewIndex].zoomState = {
+						zoom: previewZoom.getZoom(),
+						pan: previewZoom.getPan()
+					};
+				}
+			}
+
+			function clearPreview(){
+				savePreviewZoom();
+				destroyPreviewZoom();
+				var host = document.querySelector('#previewhost');
+				if(host){
+					host.innerHTML = '';
+				}
+				previewIndex = -1;
+
+				var hint = document.querySelector('#previewhint');
+				if(hint){
+					if(DeepNest.imports.length > 0){
+						hint.textContent = DeepNest.imports.length + ' files imported - select one to preview';
+						hint.style.display = 'block';
+					}
+					else{
+						hint.style.display = 'none';
+					}
+				}
+				var tools = document.querySelector('#previewzoomtools');
+				if(tools){
+					tools.style.display = 'none';
+				}
+			}
+
+			function renderPreview(index){
+				var im = DeepNest.imports[index];
+				var host = document.querySelector('#previewhost');
+				if(!im || !host){
+					clearPreview();
+					return;
+				}
+				var hint = document.querySelector('#previewhint');
+				if(hint){
+					hint.style.display = 'none';
+				}
+
+				if(previewIndex !== index || !host.querySelector('svg')){
+					savePreviewZoom();
+					destroyPreviewZoom();
+					host.innerHTML = serializeImport(im);
+					previewIndex = index;
+					try{
+						previewZoom = svgPanZoom('#previewhost svg', {
+							zoomEnabled: true,
+							controlIconsEnabled: false,
+							fit: true,
+							center: true,
+							maxZoom: 50,
+							minZoom: 0.1
+						});
+						if(im.zoomState){
+							previewZoom.zoom(im.zoomState.zoom);
+							previewZoom.pan(im.zoomState.pan);
 						}
 					}
+					catch(e){
+						console.warn('Could not initialise preview zoom', e);
+						previewZoom = null;
+					}
 				}
+
+				var tools = document.querySelector('#previewzoomtools');
+				if(tools){
+					tools.style.display = 'block';
+				}
+			}
+
+			// Kept as the existing call-site name: refresh the visible import.
+			applyzoom = function(){
+				var index = selectedImportIndex();
+				if(index < 0){
+					clearPreview();
+					return;
+				}
+				renderPreview(index);
 			};
-						
-			ractive.on('importselecthandler', function (e, im) {
-				if(im.selected){
-					return false;
+
+			function selectImport(index){
+				var imports = DeepNest.imports;
+				if(!imports.length){
+					ractive.set('selectedIndex', -1);
+					applyzoom();
+					return;
 				}
-				
-				DeepNest.imports.forEach(function(i){
-					i.selected = false;
-				});				
-				
-				im.selected = true;
+				if(index < 0 || index >= imports.length){
+					index = -1;
+				}
+				savePreviewZoom();
+				for(var i=0; i<imports.length; i++){
+					imports[i].selected = (i === index);
+				}
+				ractive.set('selectedIndex', index);
 				ractive.update('imports');
 				applyzoom();
+			}
+						
+			ractive.on('importselecthandler', function (e, im) {
+				var index = DeepNest.imports.indexOf(im);
+				if(index < 0 || im.selected){
+					return false;
+				}
+				selectImport(index);
+			});
+
+			ractive.on('importpick', function(){
+				var index = parseInt(ractive.get('selectedIndex'), 10);
+				if(isNaN(index)){
+					index = -1;
+				}
+				selectImport(index);
+			});
+
+			ractive.on('importstep', function(e, delta){
+				var index = selectedImportIndex();
+				var next;
+				if(index < 0){
+					next = (delta > 0) ? 0 : DeepNest.imports.length - 1;
+				}
+				else{
+					next = index + delta;
+				}
+				if(next < 0){ next = 0; }
+				if(next >= DeepNest.imports.length){ next = DeepNest.imports.length - 1; }
+				selectImport(next);
 			});
 			
-			ractive.on('importdelete', function(e,im){
+			ractive.on('importdelete', function(e, im){
 				var index = DeepNest.imports.indexOf(im);
-				DeepNest.imports.splice(index,1);
-				
-				if(DeepNest.imports.length > 0){
-					if(!DeepNest.imports[index]){
-						index = 0;
-					}
-					
-					DeepNest.imports[index].selected = true;
+				if(index < 0){
+					return;
 				}
-				
-				
+				if(im === DeepNest.imports[previewIndex]){
+					savePreviewZoom();
+					destroyPreviewZoom();
+				}
+				DeepNest.imports.splice(index,1);
+
 				ractive.update('imports');
-				
-				if(DeepNest.imports.length > 0){
+
+				if(DeepNest.imports.length === 0){
+					ractive.set('selectedIndex', -1);
 					applyzoom();
+					return;
+				}
+
+				var next = index;
+				if(next >= DeepNest.imports.length){
+					next = DeepNest.imports.length - 1;
+				}
+				selectImport(next);
+			});
+
+			// The zoom buttons are static (one set for the single preview
+			// host), so bind them once instead of on every applyzoom() call.
+			function bindPreviewZoomButtons(){
+				var tools = document.querySelector('#previewzoomtools');
+				if(!tools){
+					return;
+				}
+				var zoomin = tools.querySelector('.zoomin');
+				var zoomout = tools.querySelector('.zoomout');
+				var zoomreset = tools.querySelector('.zoomreset');
+				if(zoomin){
+					zoomin.onclick = function(ev){
+						ev.preventDefault();
+						if(previewZoom){ previewZoom.zoomIn(); }
+					};
+				}
+				if(zoomout){
+					zoomout.onclick = function(ev){
+						ev.preventDefault();
+						if(previewZoom){ previewZoom.zoomOut(); }
+					};
+				}
+				if(zoomreset){
+					zoomreset.onclick = function(ev){
+						ev.preventDefault();
+						if(previewZoom){ previewZoom.resetZoom().resetPan(); }
+					};
+				}
+			}
+			bindPreviewZoomButtons();
+
+			ractive.on('importcancel', function(){
+				if(activeImport){
+					activeImport.cancel();
 				}
 			});
 			
@@ -479,6 +661,9 @@
 							if (node.parentNode) {
 							  node.parentNode.removeChild(node);
 							}
+						}
+						if(DeepNest.parts[i].labelElement && DeepNest.parts[i].labelElement.parentNode){
+							DeepNest.parts[i].labelElement.parentNode.removeChild(DeepNest.parts[i].labelElement);
 						}
 						DeepNest.parts.splice(i,1);
 						i--;
@@ -506,6 +691,12 @@
 			var attachSort = function(){
 				var headers = document.querySelectorAll('#parts table thead th');
 				Array.from(headers).forEach(header => {
+					// Bind once: this used to be called after every import and
+					// stacked duplicate click handlers.
+					if(header.getAttribute('data-sort-bound') === '1'){
+						return;
+					}
+					header.setAttribute('data-sort-bound', '1');
 					header.addEventListener('click', function(e) {
 						var sortfield = header.getAttribute('data-sort-field');
 						
@@ -545,6 +736,7 @@
 					});
 				});
 			}
+			attachSort();
 			
 			// file import
 			var electron = require('electron');
@@ -559,108 +751,839 @@
 				
 				importbutton.className = 'button import disabled';
 				
-				setTimeout(function(){
+				var openFileDialog = function(){
 					var dialog = app.dialog;
-					dialog.showOpenDialog({ filters: [
-				
-					   { name: 'CAD formats', extensions: ['svg', 'dxf', 'cdr'] }
-				
-					  ]}, function (fileName) {
-						if(fileName === undefined){
+					dialog.showOpenDialog({
+						properties: ['openFile', 'multiSelections'],
+						filters: [
+							{ name: 'CAD formats', extensions: ['svg', 'dxf', 'cdr', 'nc1', 'dstv'] }
+						]
+					}, function (fileNames) {
+						if(!fileNames || fileNames.length === 0){
 							importbutton.className = 'button import';
 							console.log("No file selected");
+							return;
+						}
+						if(typeof fileNames === 'string'){
+							fileNames = [fileNames];
+						}
+						runImportBatch(fileNames);
+					});
+				};
+
+				// A browser file picker must be opened inside the click's user
+				// activation window; Electron needs a short delay instead.
+				if(window.__browserMode){
+					openFileDialog();
+				}
+				else{
+					setTimeout(openFileDialog, 50);
+				}
+
+			};
+
+			function escapeHtml(value){
+				return String(value == null ? '' : value).replace(/[&<>"']/g, function(c){
+					return {
+						'&': '&amp;',
+						'<': '&lt;',
+						'>': '&gt;',
+						'"': '&quot;',
+						"'": '&#39;'
+					}[c];
+				});
+			}
+
+			// ------------------------------------------------------------------
+			// Import scheduling
+			//
+			// - NC1 rendering and DXF metadata scans run in a worker pool.
+			// - DXF/CDR conversions run through the conversion server with a
+			//   bounded number of concurrent requests.
+			// - Results are committed to DeepNest in input order, one per
+			//   animation frame, so the UI can paint between files.
+			// ------------------------------------------------------------------
+			var detectedCores = window.__deepnestDetectedCores || 4;
+			var IMPORT_WORKER_COUNT = Math.max(1, Math.min(detectedCores - 1, 8));
+			var CONVERSION_CONCURRENCY = detectedCores >= 4 ? 4 : Math.max(1, detectedCores);
+			var CONVERT_TIMEOUT = 60000;
+			try{
+				if(navigator.deviceMemory && navigator.deviceMemory <= 4){
+					IMPORT_WORKER_COUNT = Math.max(1, Math.floor(IMPORT_WORKER_COUNT / 2));
+				}
+			}
+			catch(e){}
+
+			window.__deepnestImportStats = {
+				workerTasks: 0,
+				mainThreadTasks: 0,
+				conversions: 0
+			};
+			window.__deepnestImportErrors = [];
+			try{
+				if(/[?&]noworker=1(?:&|$)/.test(window.location.search)){
+					window.__deepnestDisableImportWorkers = true;
+				}
+			}
+			catch(e){}
+
+			function createLimiter(max){
+				var active = 0;
+				var queue = [];
+				function drain(){
+					while(active < max && queue.length > 0){
+						var task = queue.shift();
+						active++;
+						task(function release(){
+							active--;
+							drain();
+						});
+					}
+				}
+				return {
+					run: function(task){
+						queue.push(task);
+						drain();
+					}
+				};
+			}
+
+			var conversionLimiter = createLimiter(CONVERSION_CONCURRENCY);
+			var readLimiter = createLimiter(Math.max(4, Math.min(detectedCores, 8)));
+
+			var importWorkerPool = (function(){
+				var workers = [];
+				var idle = [];
+				var queue = [];
+				var unavailable = false;
+				var spawnFailures = 0;
+				var WORKER_TIMEOUT = 20000;
+				var MAX_WORKERS = IMPORT_WORKER_COUNT;
+
+				function makeError(message){
+					return new Error(message);
+				}
+
+				function retire(worker){
+					worker.__pending = null;
+					for(var i=workers.length-1; i>=0; i--){
+						if(workers[i] === worker){ workers.splice(i,1); }
+					}
+					for(i=idle.length-1; i>=0; i--){
+						if(idle[i] === worker){ idle.splice(i,1); }
+					}
+					try{ worker.terminate(); }
+					catch(e){}
+				}
+
+				function failQueued(message){
+					while(queue.length > 0){
+						var job = queue.shift();
+						job.done(makeError(message));
+					}
+				}
+
+				function assign(worker, job){
+					worker.__pending = job;
+					job.timer = setTimeout(function(){
+						if(worker.__pending === job){
+							worker.__pending = null;
+							job.done(makeError('Import worker timed out'));
+							retire(worker);
+							pump();
+						}
+					}, WORKER_TIMEOUT);
+					try{
+						worker.postMessage(job.task);
+					}
+					catch(e){
+						clearTimeout(job.timer);
+						worker.__pending = null;
+						job.done(e);
+						retire(worker);
+						pump();
+					}
+				}
+
+				function spawnWorker(){
+					var worker = new Worker('importer/import-worker.js');
+					workers.push(worker);
+					worker.__pending = null;
+
+					worker.onmessage = function(e){
+						var job = worker.__pending;
+						worker.__pending = null;
+						if(!job){
+							return;
+						}
+						clearTimeout(job.timer);
+						if(e.data && e.data.ok){
+							window.__deepnestImportStats.workerTasks++;
+							idle.push(worker);
+							job.done(null, e.data);
 						}
 						else{
-							var ext = path.extname(fileName[0]);
-							var filename = path.basename(fileName[0]);
+							job.done(makeError(e.data && e.data.error ? e.data.error : 'Import worker failed'));
+							retire(worker);
+						}
+						pump();
+					};
 
-							if(ext.toLowerCase() == '.svg'){
-								readFile(fileName[0]);
-								importbutton.className = 'button import';
+					worker.onerror = function(e){
+						var job = worker.__pending;
+						worker.__pending = null;
+						spawnFailures++;
+						if(spawnFailures >= 2){
+							unavailable = true;
+						}
+						if(job){
+							clearTimeout(job.timer);
+							job.done(makeError('Import worker error'));
+						}
+						retire(worker);
+						pump();
+					};
+
+					return worker;
+				}
+
+				function pump(){
+					if(unavailable){
+						failQueued('Import worker unavailable');
+						return;
+					}
+					while(queue.length > 0){
+						var worker = idle.pop();
+						if(!worker){
+							if(workers.length >= MAX_WORKERS){
+								break;
 							}
-							else{
-								importbutton.className = 'button import spinner';
-								
-								// send to conversion server
-								var url = config.getSync('conversionServer');
-								if(!url){
-									url = defaultConversionServer;
-								}
-								
-								var req = request.post(url, function (err, resp, body) {
-									importbutton.className = 'button import';
-									if (err) {
-										message('could not contact file conversion server', true);
-									} else {
-										if(body.substring(0, 5) == 'error'){
-											message(body, true);
-										}
-										else{
-											// expected input dimensions on server is points
-											// scale based on unit preferences
-											var con = null;
-                                            var dxfFlag = false;
-											if(ext.toLowerCase() == '.dxf'){
-												//var unit = config.getSync('units');
-												con = Number(config.getSync('dxfImportScale'));
-												dxfFlag = true;
-												console.log('con', con);
-												
-												/*if(unit == 'inch'){
-													con = 72;
-												}
-												else{
-													// mm
-													con = 2.83465;
-												}*/
-											}
-											
-											// dirpath is used for loading images embedded in svg files
-											// converted svgs will not have images
-											importData(body, filename, null, con, dxfFlag);
-										}
-									}
-								});
-
-								var form = req.form();
-								form.append('format', 'svg');
-								form.append('fileUpload', fs.createReadStream(fileName[0]));
+							try{
+								worker = spawnWorker();
+							}
+							catch(e){
+								unavailable = true;
+								failQueued('Import worker unavailable');
+								return;
 							}
 						}
-						
+						assign(worker, queue.shift());
+					}
+				}
+
+				return {
+					run: function(task, done){
+						if(unavailable || window.__deepnestDisableImportWorkers || typeof Worker === 'undefined'){
+							done(makeError('Import worker unavailable'));
+							return;
+						}
+						queue.push({task: task, done: done});
+						pump();
+					},
+					cancelAll: function(){
+						failQueued('Import cancelled');
+						var pending = workers.slice(0);
+						for(var i=0; i<pending.length; i++){
+							var job = pending[i].__pending;
+							if(job){
+								clearTimeout(job.timer);
+								job.done(makeError('Import cancelled'));
+							}
+							retire(pending[i]);
+						}
+						idle = [];
+					},
+					workerCount: function(){
+						return workers.length;
+					}
+				};
+			})();
+
+			function nc1Meta(parsed){
+				return {
+					mark: parsed.mark,
+					quantity: parsed.header.quantity,
+					material: parsed.header.material,
+					thickness: parsed.header.thickness,
+					profile: parsed.header.profile,
+					warnings: parsed.warnings,
+					source: 'nc1'
+				};
+			}
+
+			function runNc1Task(bytes, filename, done){
+				var timing = window.DeepnestTiming || window.NoopDeepnestTiming;
+				var workerStart = timing.mark();
+				importWorkerPool.run({type: 'nc1', name: filename, buffer: bytes}, function(err, data){
+					if(!err && data){
+						if(data.timings){
+							timing.record('nc1.parse', data.timings.parse);
+							timing.record('nc1.toSvg', data.timings.toSvg);
+						}
+						timing.measure('nc1.worker', workerStart);
+						done(null, data);
+						return;
+					}
+
+					// Main-thread fallback: workers can be unavailable in
+					// Electron file:// builds or after repeated worker errors.
+					window.__deepnestImportStats.mainThreadTasks++;
+					try{
+						var parseStart = timing.mark();
+						var parsed = window.Nc1.parseNc1(bytes, filename);
+						timing.measure('nc1.parse', parseStart);
+
+						var renderStart = timing.mark();
+						var rendered = window.Nc1.nc1ToSvg(parsed, {curveTolerance: 0.1});
+						timing.measure('nc1.toSvg', renderStart);
+
+						done(null, {
+							svg: rendered.svg,
+							meta: nc1Meta(parsed),
+							warnings: parsed.warnings
+						});
+					}
+					catch(e){
+						done(e);
+					}
+				});
+			}
+
+			function runDxfMetaTask(text, filename, done){
+				var timing = window.DeepnestTiming || window.NoopDeepnestTiming;
+				if(!window.DxfMeta){
+					done(null, null);
+					return;
+				}
+				var workerStart = timing.mark();
+				importWorkerPool.run({type: 'dxf-meta', name: filename, text: text}, function(err, data){
+					if(!err && data){
+						if(data.timings){
+							timing.record('dxf.meta', data.timings.meta);
+						}
+						timing.measure('dxf.meta.worker', workerStart);
+						done(null, data.meta);
+						return;
+					}
+
+					window.__deepnestImportStats.mainThreadTasks++;
+					try{
+						var metaStart = timing.mark();
+						var meta = window.DxfMeta.parseDxfMeta(text);
+						timing.measure('dxf.meta', metaStart);
+						done(null, meta);
+					}
+					catch(e){
+						done(null, null);
+					}
+				});
+			}
+
+			function releaseSourceFile(filePath){
+				try{
+					if(window.__browserShim && window.__browserShim.releaseFile){
+						window.__browserShim.releaseFile(filePath);
+					}
+				}
+				catch(e){}
+			}
+
+			var activeImport = null;
+			var importBatchToken = 0;
+
+			function runImportBatch(fileNames){
+				importbutton.className = 'button import spinner';
+				ractive.set('importBusy', true);
+				ractive.set('importStatus', '');
+				window.__deepnestImportBusy = true;
+
+				var timing = window.DeepnestTiming || window.NoopDeepnestTiming;
+				var total = fileNames.length;
+				var results = new Array(total);
+				var committed = 0;
+				var failures = [];
+				var warnings = [];
+				var finished = false;
+				var cancelled = false;
+				var pendingCommit = false;
+				var token = ++importBatchToken;
+
+				timing.beginBatch('import', total);
+				var batchStart = timing.mark();
+				var debugState = window.__deepnestImportDebug = {
+					total: total,
+					results: [],
+					committed: 0,
+					finished: false
+				};
+
+				var batch = {
+					finished: false,
+					cancel: function(){
+						if(finished){
+							return;
+						}
+						cancelled = true;
+						importBatchToken++;
+						importWorkerPool.cancelAll();
+						finishBatch(true);
+					}
+				};
+				activeImport = batch;
+
+				function updateImportStatus(){
+					var text = committed + '/' + total;
+					if(committed < total){
+						text += ' - ' + path.basename(fileNames[committed]);
+					}
+					if(cancelled){
+						text = 'Cancelling ' + text;
+					}
+					ractive.set('importStatus', text);
+				}
+
+				function applyResult(result, index){
+					if(!result.ok){
+						failures.push({
+							name: path.basename(fileNames[index]),
+							error: result.error || new Error('Import failed')
+						});
+						console.warn('Import failed: ' + fileNames[index], result.error);
+						return;
+					}
+					if(result.warning){
+						warnings.push(result.warning);
+						console.warn(result.warning);
+					}
+					if(!result.payload){
+						failures.push({
+							name: path.basename(fileNames[index]),
+							error: new Error('No data produced')
+						});
+						return;
+					}
+					importData(
+						result.payload.svg,
+						result.payload.filename,
+						result.payload.dirpath,
+						result.payload.scalingFactor,
+						result.payload.dxfFlag,
+						result.payload.meta,
+						true
+					);
+				}
+
+				function scheduleCommit(){
+					if(finished || pendingCommit){
+						return;
+					}
+					if(committed >= total){
+						finishBatch(false);
+						return;
+					}
+					if(!results[committed]){
+						return;
+					}
+
+					pendingCommit = true;
+					// A timer (not requestAnimationFrame) guarantees the queue
+					// advances even when the window is hidden/backgrounded.
+					setTimeout(function(){
+						pendingCommit = false;
+						if(finished || token !== importBatchToken){
+							return;
+						}
+						var index = committed;
+						var result = results[index];
+						results[index] = null;
+						committed++;
+						debugState.committed = committed;
+						try{
+							applyResult(result, index);
+						}
+						catch(e){
+							window.__deepnestImportErrors.push(String(e && e.stack ? e.stack : e));
+							failures.push({name: path.basename(fileNames[index]), error: e});
+							console.warn('Import failed: ' + fileNames[index], e);
+						}
+						updateImportStatus();
+						scheduleCommit();
+					}, 0);
+				}
+
+				function recordResult(index, err, warning, payload){
+					if(results[index] || finished){
+						return;
+					}
+					debugState.results[index] = err ? ('error: ' + err.message) : 'ok';
+					results[index] = {
+						ok: !err,
+						error: err || null,
+						warning: warning || null,
+						payload: payload || null
+					};
+					scheduleCommit();
+				}
+
+				function finishBatch(wasCancelled){
+					if(batch.finished){
+						return;
+					}
+					batch.finished = true;
+					finished = true;
+					activeImport = null;
+					debugState.finished = true;
+					window.__deepnestImportBusy = false;
+
+					var stepStart = timing.mark();
+
+					// Larger batches do not auto-open a preview: rendering all
+					// of them is exactly what froze the UI. The tab strip or
+					// picker lets the user open one on demand.
+					var autoOpen = (!wasCancelled && total <= 5 && DeepNest.imports.length <= 5);
+					for(var i=0; i<DeepNest.imports.length; i++){
+						DeepNest.imports[i].selected = false;
+					}
+					var selected = -1;
+					if(autoOpen && DeepNest.imports.length > 0){
+						selected = DeepNest.imports.length - 1;
+						DeepNest.imports[selected].selected = true;
+					}
+					ractive.set('selectedIndex', selected);
+
+					ractive.update('imports');
+					timing.measure('render.imports', stepStart);
+
+					stepStart = timing.mark();
+					ractive.update('parts');
+					timing.measure('render.parts', stepStart);
+
+					stepStart = timing.mark();
+					applyzoom();
+					timing.measure('render.zoom', stepStart);
+
+					stepStart = timing.mark();
+					resize();
+					timing.measure('render.resize', stepStart);
+
+					ractive.set('importBusy', false);
+					ractive.set('importStatus', '');
+					importbutton.className = 'button import';
+
+					var imported = committed - failures.length;
+					if(wasCancelled){
+						message('Import cancelled. Imported ' + imported + ' of ' + total + ' files.', true);
+					}
+					else if(failures.length > 0){
+						if(total === 1){
+							message('Import failed: ' + escapeHtml(failures[0].error.message), true);
+						}
+						else{
+							var failedNames = failures.map(function(failure){
+								return escapeHtml(failure.name);
+							}).join(', ');
+							message('Imported ' + imported + ' of ' + total + ' files. Failed: ' + failedNames, true);
+						}
+					}
+					else if(total > 1){
+						message('Imported ' + total + ' files', false);
+					}
+					else if(warnings.length > 0){
+						message(escapeHtml(warnings[0]), false);
+					}
+
+					timing.measure('batch.total', batchStart);
+					timing.endBatch();
+				}
+
+				function startFile(i){
+					var filePath = fileNames[i];
+					var fileStart = timing.mark();
+					processImportFile(filePath, function(err, warning, payload){
+						releaseSourceFile(filePath);
+						timing.recordFile(path.basename(filePath), timing.now() - fileStart, !err);
+						recordResult(i, err, warning, payload);
 					});
-				}, 50);
-				
-			};
+				}
+
+				updateImportStatus();
+
+				for(var f=0; f<total; f++){
+					startFile(f);
+				}
+			}
+
+			function processImportFile(filePath, done){
+				var ext = path.extname(filePath);
+				var lowerExt = ext.toLowerCase();
+				var filename = path.basename(filePath);
+				var timing = window.DeepnestTiming || window.NoopDeepnestTiming;
+				var finished = false;
+
+				function finish(err, warning, payload){
+					if(finished){
+						return;
+					}
+					finished = true;
+					done(err, warning, payload);
+				}
+
+				if(lowerExt !== '.svg' && lowerExt !== '.nc1' && lowerExt !== '.dstv' &&
+					lowerExt !== '.dxf' && lowerExt !== '.cdr'){
+					finish(new Error('Unsupported file type: ' + ext));
+					return;
+				}
+
+				readLimiter.run(function(release){
+					if(!activeImport){
+						release();
+						finish(new Error('Import cancelled'));
+						return;
+					}
+
+					if(lowerExt == '.svg'){
+						var svgReadStart = timing.mark();
+						readFile(filePath, 'utf-8', function(err, data){
+							timing.measure('import.read', svgReadStart);
+							release();
+							if(err){
+								finish(err);
+								return;
+							}
+							finish(null, null, {
+								svg: data,
+								filename: filename,
+								dirpath: path.dirname(filePath),
+								scalingFactor: null,
+								dxfFlag: false,
+								meta: null
+							});
+						}, true);
+						return;
+					}
+
+					if(lowerExt == '.nc1' || lowerExt == '.dstv'){
+						var ncReadStart = timing.mark();
+						readFileBytes(filePath, function(err, bytes){
+							timing.measure('import.read', ncReadStart);
+							release();
+							if(err){
+								finish(err);
+								return;
+							}
+							runNc1Task(bytes, filename, function(taskErr, result){
+								if(taskErr){
+									finish(taskErr);
+									return;
+								}
+								finish(null, result.warnings && result.warnings.length > 0 ?
+									result.warnings[0].message : null, {
+									svg: result.svg,
+									filename: filename,
+									dirpath: null,
+									scalingFactor: null,
+									dxfFlag: false,
+									meta: result.meta
+								});
+							});
+						});
+						return;
+					}
+
+					if(lowerExt == '.dxf'){
+						// Read the raw DXF locally for the TEXT attribute block.
+						// Geometry still goes through the conversion server.
+						var dxfReadStart = timing.mark();
+						readFile(filePath, 'utf-8', function(err, text){
+							timing.measure('import.read', dxfReadStart);
+							release();
+							if(err){
+								finish(err);
+								return;
+							}
+							runDxfMetaTask(text, filename, function(metaErr, meta){
+								if(metaErr){
+									console.warn('DXF metadata scan failed', metaErr);
+								}
+								convertFileWithLimit(filePath, ext, meta || null, filename, function(convErr, body){
+									if(convErr){
+										finish(convErr);
+										return;
+									}
+									finish(null, null, {
+										svg: body,
+										filename: filename,
+										dirpath: null,
+										scalingFactor: Number(config.getSync('dxfImportScale')),
+										dxfFlag: true,
+										meta: meta || null
+									});
+								});
+							});
+						}, true);
+						return;
+					}
+
+					// .cdr goes straight to the conversion server.
+					release();
+					convertFileWithLimit(filePath, ext, null, filename, function(convErr, body){
+						if(convErr){
+							finish(convErr);
+							return;
+						}
+						finish(null, null, {
+							svg: body,
+							filename: filename,
+							dirpath: null,
+							scalingFactor: null,
+							dxfFlag: false,
+							meta: null
+						});
+					});
+				});
+			}
 			
-			function readFile(filepath){
-				fs.readFile(filepath, 'utf-8', function (err, data) {
+			function readFile(filepath, encoding, callback, quiet){
+				if(typeof encoding === 'function'){
+					callback = encoding;
+					encoding = 'utf-8';
+				}
+				if(!encoding){
+					encoding = 'utf-8';
+				}
+				fs.readFile(filepath, encoding, function (err, data) {
 					  if(err){
-						  message("An error ocurred reading the file :" + err.message, true);
+						  if(!quiet){
+							  message("An error ocurred reading the file :" + err.message, true);
+						  }
+						  if(callback){
+							  callback(err);
+						  }
+						  return;
+					  }
+					  if(callback){
+						  callback(null, data);
 						  return;
 					  }
 					  var filename = path.basename(filepath);
 					  var dirpath = path.dirname(filepath);
 					  
-					  importData(data, filename, dirpath, null);
+					  importData(data, filename, dirpath, null, false, null);
 				});
 			};
-			
-			function importData(data, filename, dirpath, scalingFactor, dxfFlag){
-				window.DeepNest.importsvg(filename, dirpath, data, scalingFactor, dxfFlag);
 
-				DeepNest.imports.forEach(function(im){
-				im.selected = false;
+			function readFileBytes(filepath, callback){
+				fs.readFile(filepath, function(err, data){
+					if(err){
+						callback(err);
+						return;
+					}
+					// Electron returns a Buffer; the browser shim returns an
+					// ArrayBuffer. Nc1 accepts either.
+					callback(null, data);
+				});
+			}
+
+			function convertFile(filePath, ext, meta, filename, done){
+				// send to conversion server
+				var url = config.getSync('conversionServer');
+				if(!url){
+					url = defaultConversionServer;
+				}
+
+				var timing = window.DeepnestTiming || window.NoopDeepnestTiming;
+				var convertStart = timing.mark();
+				var settled = false;
+				var req = null;
+				var timer = null;
+
+				function finish(err, body){
+					if(settled){
+						return;
+					}
+					settled = true;
+					if(timer){
+						clearTimeout(timer);
+					}
+					timing.measure('import.convert', convertStart);
+					done(err, body);
+				}
+
+				timer = setTimeout(function(){
+					if(req && req.abort){
+						try{ req.abort(); }
+						catch(e){}
+					}
+					finish(new Error('The file conversion server timed out.'));
+				}, CONVERT_TIMEOUT);
+
+				req = request.post(url, function (err, resp, body) {
+					if (err) {
+						var networkError = new Error('Could not contact the file conversion server.');
+						networkError.retryable = true;
+						finish(networkError);
+						return;
+					}
+					if(!body){
+						finish(new Error('The file conversion server returned an empty response.'));
+						return;
+					}
+					if(body.substring(0, 5) == 'error'){
+						finish(new Error(body));
+						return;
+					}
+					finish(null, body);
 				});
 
-				DeepNest.imports[DeepNest.imports.length-1].selected = true;
+				try{
+					var stream = fs.createReadStream(filePath);
+					if(!stream){
+						throw new Error('Could not open ' + filePath);
+					}
+					var form = req.form();
+					form.append('format', 'svg');
+					form.append('fileUpload', stream);
+				}
+				catch(e){
+					finish(e);
+				}
+			}
 
-				ractive.update('imports');
+			function convertFileWithLimit(filePath, ext, meta, filename, done){
+				conversionLimiter.run(function(release){
+					window.__deepnestImportStats.conversions++;
+					convertFile(filePath, ext, meta, filename, function(err, body){
+						if(err && err.retryable){
+							// One retry on transient network failures.
+							convertFile(filePath, ext, meta, filename, function(retryErr, retryBody){
+								release();
+								done(retryErr, retryBody);
+							});
+							return;
+						}
+						release();
+						done(err, body);
+					});
+				});
+			}
+			
+			function importData(data, filename, dirpath, scalingFactor, dxfFlag, meta, batch){
+				var timing = window.DeepnestTiming || window.NoopDeepnestTiming;
+				var importStart = timing.mark();
+				window.DeepNest.importsvg(filename, dirpath, data, scalingFactor, dxfFlag, meta);
+				timing.measure('import.importsvg', importStart);
+
+				if(batch){
+					return;
+				}
+
+				var renderStart = timing.mark();
 				ractive.update('parts');
 
-				attachSort();
-				applyzoom();
+				var selected = DeepNest.imports.length - 1;
+				selectImport(selected);
 				resize();
+				timing.measure('render.single', renderStart);
 			}
 			
 			// part list resize
@@ -1018,6 +1941,20 @@
 						if(selected.length == 0){
 							return false;
 						}
+
+						var nest = selected.pop();
+						var marks = [];
+						if(config.getSync('partMarks') !== false){
+							nest.placements.forEach(function(s){
+								s.sheetplacements.forEach(function(p){
+									var part = DeepNest.parts[p.source];
+									if(part && part.mark){
+										marks.push(part.mark);
+									}
+								});
+							});
+						}
+
 						// send to conversion server
 						var url = config.getSync('conversionServer');
 						if(!url){
@@ -1035,6 +1972,20 @@
 									message(body, true);
 								}
 								else{
+									// Inkscape writes one label as several TEXT
+									// entities. Merge them back to one per mark.
+									if(window.DxfLabels && marks.length > 0){
+										try{
+											var rewritten = window.DxfLabels.rewriteDxfLabels(body, marks);
+											if(rewritten.warnings && rewritten.warnings.length > 0){
+												console.warn(rewritten.warnings);
+											}
+											body = rewritten.text;
+										}
+										catch(e){
+											console.warn('DXF label merge failed', e);
+										}
+									}
 									fs.writeFileSync(fileName, body);
 								}
 							}
@@ -1042,7 +1993,7 @@
 
 						var form = req.form();
 						form.append('format', 'dxf');
-						form.append('fileUpload', exportNest(selected.pop(), true), {
+						form.append('fileUpload', exportNest(nest, true), {
 						  filename: 'deepnest.svg',
 						  contentType: 'image/svg+xml'
 						});
@@ -1104,6 +2055,7 @@
 				
 				var svgwidth = 0;
 				var svgheight = 0;
+				var marks = [];
 				
 				// create elements if they don't exist, show them otherwise
 				n.placements.forEach(function(s){
@@ -1117,6 +2069,8 @@
 					});*/
 					
 					var sheetbounds = DeepNest.parts[s.sheet].bounds;
+					var sheetOffsetX = -sheetbounds.x;
+					var sheetOffsetY = svgheight - sheetbounds.y;
 					
 					group.setAttribute('transform', 'translate('+(-sheetbounds.x)+' '+(svgheight-sheetbounds.y)+')');
 					if(svgwidth < sheetbounds.width){
@@ -1144,6 +2098,18 @@
 						
 						// position part
 						partgroup.setAttribute('transform','translate('+p.x+' '+p.y+') rotate('+p.rotation+')');
+
+						if(config.getSync('partMarks') !== false && part.mark){
+							var markAngle = (p.rotation || 0) * Math.PI / 180;
+							var markCX = part.bounds.x + part.bounds.width / 2;
+							var markCY = part.bounds.y + part.bounds.height / 2;
+							marks.push({
+								text: part.mark,
+								x: p.x + markCX * Math.cos(markAngle) - markCY * Math.sin(markAngle) + sheetOffsetX,
+								y: p.y + markCX * Math.sin(markAngle) + markCY * Math.cos(markAngle) + sheetOffsetY,
+								size: Math.max(1, Math.min(part.bounds.width, part.bounds.height) * 0.08)
+							});
+						}
 					});
 					
 					// put next sheet below
@@ -1182,6 +2148,25 @@
                     });
 				}
 				
+				// Add marks after line merging so the merge passes never see text.
+				if(config.getSync('partMarks') !== false && marks.length > 0){
+					var markgroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+					markgroup.setAttribute('class', 'part-marks');
+					marks.forEach(function(m){
+						var text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+						text.setAttribute('x', m.x);
+						text.setAttribute('y', m.y);
+						text.setAttribute('font-size', m.size);
+						text.setAttribute('text-anchor', 'middle');
+						text.setAttribute('dominant-baseline', 'middle');
+						text.setAttribute('fill', '#000000');
+						text.setAttribute('stroke', 'none');
+						text.textContent = m.text;
+						markgroup.appendChild(text);
+					});
+					svg.appendChild(markgroup);
+				}
+
 				return (new XMLSerializer()).serializeToString(svg);
 			}
 			
@@ -1608,6 +2593,8 @@
 				<ul class="topnav">
 					<li class="button import" id="import">Import</li>
 					<li class="button start {{ getSheets().length == 0 ? "disabled" : "" }}" id="startnest">Start nest</li>
+					<li class="importstatus" id="importstatus">{{ importStatus }}</li>
+					<li class="button importcancel" id="importcancel" style="display: {{ importBusy ? 'block' : 'none' }}" on-click="importcancel">Cancel</li>
 				</ul>
 				
 				<div id="parts" class="parts-drag">
@@ -1617,6 +2604,7 @@
 							<thead>
 								<tr>
 									<th><span></span></th>
+									<th data-sort-field="mark"><span>Mark</span></th>
 									<th data-sort-field="area"><span>Size</span></th>
 									<th data-sort-field="sheet"><span>Sheet</span></th>
 									<th data-sort-field="quantity"><span>Quantity</span></th>
@@ -1625,7 +2613,8 @@
 							<tbody>
 								{{#each parts:i}}
 									<tr on-mouseenter-mousedown="selecthandler:{{this}}" class='{{ selected ? "active" : "" }}'>
-										<td>{{{ partrenderer(this) }}} <span style="display: none">{{bounds.width}}</span></td>
+										<td>{{#if thumbnail}}{{{ thumbnail }}}{{else}}<span class="thumb-placeholder"></span>{{/if}} <span style="display: none">{{bounds.width}}</span></td>
+										<td><input type="text" value="{{mark}}" /></td>
 										<td><dimensionLabel/></td>
 										<td><input type="checkbox" checked='{{sheet}}' /></td>
 										<td><input type="number" min="1" step="1" value="{{quantity}}" /></td>
@@ -1653,27 +2642,37 @@
 				
 				<div id="imports">
 					{{#if imports.length > 0}}
-					<ul id="importsnav">
-						{{#each imports}}
-							<li class='{{ selected ? "active" : "" }}' on-click="importselecthandler:{{this}}">
-								{{ filename }}
-								<a href="#" class="close" on-click="importdelete:{{this}}"></a>
-							</li>
-						{{/each}}	
-					</ul>
+						{{#if imports.length > 10}}
+						<div id="importpicker">
+							<a href="#" class="prev" on-click="importstep:-1"></a>
+							<select value="{{ selectedIndex }}" on-change="importpick">
+								<option value="-1">{{ imports.length }} files - select one</option>
+								{{#each imports:i}}
+									<option value="{{ i }}">{{ label }}</option>
+								{{/each}}
+							</select>
+							<a href="#" class="next" on-click="importstep:1"></a>
+						</div>
+						{{else}}
+						<ul id="importsnav">
+							{{#each imports}}
+								<li class='{{ selected ? "active" : "" }}' title="{{ filename }}" on-click="importselecthandler:{{this}}">
+									{{ label }}
+									<a href="#" class="close" on-click="importdelete:{{this}}"></a>
+								</li>
+							{{/each}}	
+						</ul>
+						{{/if}}
 					{{/if}}
 					
-					{{#each imports:i}}
-						<div id="import-{{i}}" class='import {{ selected ? "active" : "" }}'>
-							{{{ serializeSvg(svg) }}}
-							
-							<div class="zoomtools">
-							<a href="#" class="zoomreset"></a>
-							<a href="#" class="zoomin"></a>
-							<a href="#" class="zoomout"></a>
-							</div>
-						</div>
-					{{/each}}	
+					<div id="previewhint"></div>
+					<div id="previewhost"></div>
+					
+					<div class="zoomtools" id="previewzoomtools" style="display: none">
+						<a href="#" class="zoomreset"></a>
+						<a href="#" class="zoomin"></a>
+						<a href="#" class="zoomout"></a>
+					</div>
 				</div>
 			</script>
 		</div>
@@ -1766,6 +2765,11 @@
 						<input type="checkbox" checked="checked" data-config="mergeLines" />
 					</dd>
 					
+					<dt>Include part marks in export</dt>
+					<dd>
+						<input type="checkbox" checked="checked" data-config="partMarks" />
+					</dd>
+
 					<dt>Optimization ratio</dt>
 					<dd>
 						<input type="number" value="0.5" min="0" max="1" step="any" data-config="timeRatio" required />

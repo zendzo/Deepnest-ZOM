@@ -1,0 +1,253 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Deepnest batch import end-to-end</title></head>
+<body data-e2e="RUNNING"><pre id="log"></pre>
+<script>
+(function () {
+	var logElement = document.getElementById('log');
+	var finished = false;
+
+	function log(message) {
+		logElement.textContent += message + '\n';
+	}
+
+	function finish(result) {
+		if (finished) {
+			return;
+		}
+		finished = true;
+		document.body.setAttribute('data-e2e', result);
+		log(result);
+	}
+
+	window.onerror = function (message, source, line) {
+		finish('FAIL: ' + message + ' @ ' + source + ':' + line);
+	};
+
+	var globalTimeout = setTimeout(function () {
+		if (!finished) {
+			finish('FAIL: overall timeout');
+		}
+	}, 200000);
+
+	var dxf = [
+		'0', 'SECTION', '2', 'HEADER',
+		'9', '$ACADVER', '1', 'AC1009',
+		'9', '$INSUNITS', '70', '4',
+		'0', 'ENDSEC',
+		'0', 'SECTION', '2', 'TABLES',
+		'0', 'TABLE', '2', 'LAYER', '70', '2',
+		'0', 'LAYER', '2', '0', '70', '0', '62', '7', '6', 'CONTINUOUS',
+		'0', 'LAYER', '2', 'TEXT', '70', '0', '62', '7', '6', 'CONTINUOUS',
+		'0', 'ENDTAB',
+		'0', 'ENDSEC',
+		'0', 'SECTION', '2', 'ENTITIES',
+		'0', 'POLYLINE', '8', '0', '66', '1', '10', '0', '20', '0', '30', '0', '70', '1',
+		'0', 'VERTEX', '8', '0', '10', '0', '20', '0', '30', '0',
+		'0', 'VERTEX', '8', '0', '10', '100', '20', '0', '30', '0',
+		'0', 'VERTEX', '8', '0', '10', '100', '20', '100', '30', '0',
+		'0', 'VERTEX', '8', '0', '10', '0', '20', '100', '30', '0',
+		'0', 'SEQEND',
+		'0', 'TEXT', '8', 'TEXT', '62', '7', '10', '10', '20', '90', '40', '5', '1', '[N]BATCH-DXF',
+		'0', 'TEXT', '8', 'TEXT', '62', '7', '10', '10', '20', '80', '40', '5', '1', '[Q]1',
+		'0', 'ENDSEC',
+		'0', 'EOF'
+	].join('\n');
+
+	var nc1 = [
+		'ST', '** BATCH-NC1.nc1', '  PROJECT', '  LOT', '  PHASE',
+		'  BATCH-NC1', '  S355 (5)', '  2', '  PL8*100', 'B',
+		'AK', '  v 0 0', '  80 0', '  80 50', '  0 50', '  0 0',
+		'IK', '  v 10 10', '  20 10', '  20 20', '  10 20', '  10 10',
+		'EN'
+	].join('\n');
+
+	var frame = document.createElement('iframe');
+	frame.style.width = '1200px';
+	frame.style.height = '800px';
+	frame.style.display = 'none';
+	frame.src = '/main/index.html';
+	document.body.appendChild(frame);
+
+	frame.onload = function () {
+		var win = frame.contentWindow;
+		var attempts = 0;
+		var waitForApp = setInterval(function () {
+			attempts++;
+			if (!win.DeepNest || !win.document.querySelector('#import') || !win.__browserShim) {
+				if (attempts > 300) {
+					clearInterval(waitForApp);
+					finish('FAIL: app did not initialize');
+				}
+				return;
+			}
+			clearInterval(waitForApp);
+			run(win);
+		}, 50);
+	};
+
+	function run(win) {
+		try {
+			// The virtual-time harness passes ?noworker=1 because it cannot
+			// reliably wait for real worker startup.
+			if (/[?&]noworker=1(?:&|$)/.test(window.location.search)) {
+				win.__deepnestDisableImportWorkers = true;
+			}
+
+			// Enable the import profiler before the batch starts so the app
+			// records per-stage timings for this run.
+			win.DeepnestTiming.enable();
+
+			var dxfFile = new win.File([dxf], 'batch.dxf', { type: 'application/dxf' });
+			var nc1File = new win.File([nc1], 'batch.nc1', { type: 'text/plain' });
+			var badFile = new win.File(['this is not an NC1 file'], 'bad.nc1', { type: 'text/plain' });
+
+			var paths = [
+				win.__browserShim.registerFile(dxfFile),
+				win.__browserShim.registerFile(badFile),
+				win.__browserShim.registerFile(nc1File)
+			];
+
+			var electron = win.require('electron');
+			electron.remote.dialog.showOpenDialog = function (options, callback) {
+				callback(paths);
+			};
+
+			win.document.querySelector('#import').click();
+			log('batch import started with ' + paths.length + ' files');
+
+			var attempts = 0;
+			var waitForImport = setInterval(function () {
+				attempts++;
+				// finishBatch() updates the part list before it closes the
+				// timing batch, so wait for the profile as well.
+				if (win.DeepNest.imports.length === 2 && win.DeepNest.parts.length === 2 &&
+					win.__deepnestImportProfile) {
+					clearInterval(waitForImport);
+					check(win);
+					return;
+				}
+				if (attempts > 900) {
+					clearInterval(waitForImport);
+					finish('FAIL: batch import did not finish (imports=' +
+						win.DeepNest.imports.length + ' parts=' + win.DeepNest.parts.length +
+						' profile=' + !!win.__deepnestImportProfile +
+						' debug=' + JSON.stringify(win.__deepnestImportDebug || {}) +
+						' msg=' + (win.document.querySelector('#messagecontent').textContent || '') +
+						' errors=' + JSON.stringify(win.__deepnestImportErrors || []).slice(0, 600) + ')');
+				}
+			}, 100);
+		} catch (error) {
+			finish('FAIL: ' + error.message);
+		}
+	}
+
+	function check(win) {
+		var marks = win.DeepNest.parts.map(function (part) {
+			return part.mark;
+		});
+		log('imports=' + win.DeepNest.imports.length + ' parts=' + win.DeepNest.parts.length);
+		log('marks=' + JSON.stringify(marks));
+
+		if (marks.indexOf('BATCH-DXF') < 0) {
+			finish('FAIL: DXF file was not imported');
+			return;
+		}
+		if (marks.indexOf('BATCH-NC1') < 0) {
+			finish('FAIL: NC1 file after the bad file was not imported');
+			return;
+		}
+		if (!win.DeepNest.imports[win.DeepNest.imports.length - 1].selected) {
+			finish('FAIL: last successful import is not selected');
+			return;
+		}
+
+		var messageText = win.document.querySelector('#messagecontent').textContent || '';
+		log('summary=' + messageText);
+		if (messageText.indexOf('Failed') < 0 || messageText.indexOf('bad.nc1') < 0) {
+			finish('FAIL: failure summary does not mention bad.nc1');
+			return;
+		}
+
+		var rows = win.document.querySelectorAll('#parts tbody tr');
+		if (rows.length !== 2) {
+			finish('FAIL: expected 2 part rows, got ' + rows.length);
+			return;
+		}
+
+		var profile = win.__deepnestImportProfile;
+		if (!profile) {
+			finish('FAIL: import timing profile was not recorded');
+			return;
+		}
+
+		var names = profile.stages.map(function (stage) { return stage.name; });
+		log('timing total=' + profile.total.toFixed(1) + 'ms files=' + profile.files +
+			' failures=' + profile.failures);
+		log('timing stages=' + names.join(', '));
+		log('timing detail=' + profile.stages.map(function (stage) {
+			return stage.name + ':' + stage.count + 'x/' + stage.total.toFixed(2) + 'ms';
+		}).join(' | '));
+		log('timing slowest=' + profile.slowest.map(function (file) {
+			return file.name + ':' + file.ms.toFixed(2) + 'ms' + (file.ok ? '' : '(failed)');
+		}).join(' | '));
+
+		var requiredStages = [
+			'import.read', 'nc1.parse', 'nc1.toSvg', 'dxf.meta', 'import.convert',
+			'svgparser.load', 'svgparser.clean', 'clean.mergeLines', 'deepnest.getParts',
+			'importsvg.total', 'import.importsvg', 'render.imports', 'render.parts',
+			'render.zoom', 'batch.total'
+		];
+		for (var i = 0; i < requiredStages.length; i++) {
+			if (names.indexOf(requiredStages[i]) < 0) {
+				finish('FAIL: timing stage missing: ' + requiredStages[i] +
+					' (got ' + names.join(', ') + ')');
+				return;
+			}
+		}
+		if (profile.files !== 3 || profile.failures !== 1) {
+			finish('FAIL: expected 3 timed files with 1 failure, got files=' +
+				profile.files + ' failures=' + profile.failures);
+			return;
+		}
+		for (i = 0; i < profile.stages.length; i++) {
+			var stage = profile.stages[i];
+			if (typeof stage.avg !== 'number' || !isFinite(stage.avg) || stage.count < 1) {
+				finish('FAIL: invalid timing sample for ' + stage.name);
+				return;
+			}
+		}
+
+		postProfile(win);
+
+		clearTimeout(globalTimeout);
+		finish('PASS');
+	}
+
+	// tools/profile-browser.js passes ?profileUrl=... so it can capture the
+	// real-clock profile without DevTools remote debugging.
+	function postProfile(win) {
+		var url = new URLSearchParams(window.location.search).get('profileUrl');
+		if (!url) {
+			return;
+		}
+		var profile = win.__deepnestImportProfile;
+		if (!profile) {
+			return;
+		}
+		try {
+			var payload = JSON.parse(JSON.stringify(profile));
+			payload.stats = win.__deepnestImportStats || null;
+			fetch(url, {
+				method: 'POST',
+				headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+				body: JSON.stringify(payload)
+			});
+		} catch (error) {
+			log('profile post failed: ' + error.message);
+		}
+	}
+})();
+</script>
+</body>
+</html>

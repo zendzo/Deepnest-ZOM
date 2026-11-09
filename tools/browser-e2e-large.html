@@ -1,0 +1,231 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Deepnest large batch import end-to-end</title></head>
+<body data-e2e="RUNNING"><pre id="log"></pre>
+<script>
+(function () {
+	var logElement = document.getElementById('log');
+	var finished = false;
+
+	function log(message) {
+		logElement.textContent += message + '\n';
+	}
+
+	function finish(result) {
+		if (finished) {
+			return;
+		}
+		finished = true;
+		document.body.setAttribute('data-e2e', result);
+		log(result);
+	}
+
+	function fail(message) {
+		finish('FAIL: ' + message);
+	}
+
+	window.onerror = function (message, source, line) {
+		finish('FAIL: ' + message + ' @ ' + source + ':' + line);
+	};
+
+	var globalTimeout = setTimeout(function () {
+		if (!finished) {
+			finish('FAIL: overall timeout');
+		}
+	}, 200000);
+
+	function nc1Text(mark) {
+		return [
+			'ST', '** ' + mark + '.nc1', '  PROJECT', '  LOT', '  PHASE',
+			'  ' + mark, '  S355 (5)', '  1', '  PL8*100', 'B',
+			'AK', '  v 0 0', '  100 0', '  100 50', '  0 50', '  0 0',
+			'IK', '  v 10 10', '  20 10', '  20 20', '  10 20', '  10 10',
+			'EN'
+		].join('\n');
+	}
+
+	var frame = document.createElement('iframe');
+	frame.style.width = '1200px';
+	frame.style.height = '800px';
+	frame.style.display = 'none';
+	frame.src = '/main/index.html';
+	document.body.appendChild(frame);
+
+	frame.onload = function () {
+		var win = frame.contentWindow;
+		var attempts = 0;
+		var waitForApp = setInterval(function () {
+			attempts++;
+			if (!win.DeepNest || !win.document.querySelector('#import') || !win.__browserShim) {
+				if (attempts > 600) {
+					clearInterval(waitForApp);
+					fail('app did not initialize');
+				}
+				return;
+			}
+			clearInterval(waitForApp);
+			run(win);
+		}, 50);
+	};
+
+	function run(win) {
+		try {
+			if (/[?&]noworker=1(?:&|$)/.test(window.location.search)) {
+				win.__deepnestDisableImportWorkers = true;
+			}
+			runBatch(win, 7, 'F01', function () {
+				checkTabs(win);
+			});
+		} catch (error) {
+			fail(error.message);
+		}
+	}
+
+	function runBatch(win, count, startMark, done) {
+		var files = [];
+		var paths = [];
+		for (var i = 0; i < count; i++) {
+			var mark = startMark.replace(/(\d+)$/, function (match, number) {
+				var next = parseInt(number, 10) + i;
+				return next < 10 ? '0' + next : String(next);
+			});
+			var file = new win.File([nc1Text(mark)], mark + '.nc1', { type: 'text/plain' });
+			paths.push(win.__browserShim.registerFile(file));
+			files.push(mark);
+		}
+
+		var electron = win.require('electron');
+		electron.remote.dialog.showOpenDialog = function (options, callback) {
+			callback(paths);
+		};
+
+		var expected = win.DeepNest.imports.length + count;
+		win.document.querySelector('#import').click();
+		log('batch started with ' + count + ' files, expecting ' + expected + ' imports');
+
+		var attempts = 0;
+		var poll = setInterval(function () {
+			attempts++;
+			if (win.DeepNest.imports.length === expected && win.__deepnestImportBusy === false) {
+				clearInterval(poll);
+				done(files);
+				return;
+			}
+			if (attempts > 1200) {
+				clearInterval(poll);
+				fail('batch did not finish (imports=' + win.DeepNest.imports.length +
+					' expected=' + expected + ' busy=' + win.__deepnestImportBusy +
+					' debug=' + JSON.stringify(win.__deepnestImportDebug || {}) + ')');
+			}
+		}, 100);
+	}
+
+	function importsByMark(win) {
+		var result = {};
+		win.DeepNest.imports.forEach(function (im) {
+			result[im.mark] = im;
+		});
+		return result;
+	}
+
+	function previewSvg(win) {
+		return win.document.querySelector('#previewhost svg');
+	}
+
+	function checkTabs(win) {
+		var nav = win.document.querySelector('#importsnav');
+		if (!nav) {
+			return fail('tab strip missing for 7 imports');
+		}
+		if (win.document.querySelector('#importpicker')) {
+			return fail('picker shown for 7 imports');
+		}
+		var items = nav.querySelectorAll('li');
+		if (items.length !== 7) {
+			return fail('expected 7 tabs, got ' + items.length);
+		}
+
+		var byMark = importsByMark(win);
+		var marks = ['F01', 'F02', 'F03', 'F04', 'F05', 'F06', 'F07'];
+		for (var i = 0; i < marks.length; i++) {
+			if (!byMark[marks[i]]) {
+				return fail('missing import ' + marks[i]);
+			}
+			if (items[i].textContent.indexOf(marks[i]) < 0) {
+				return fail('tab ' + i + ' does not show mark ' + marks[i] + ' (text=' + items[i].textContent + ')');
+			}
+			var labels = byMark[marks[i]].svg.querySelectorAll('text.part-label');
+			if (labels.length !== 1 || labels[0].textContent !== marks[i]) {
+				return fail('on-canvas label missing for ' + marks[i]);
+			}
+		}
+
+		var selected = win.DeepNest.imports.filter(function (im) { return im.selected; });
+		if (selected.length !== 0) {
+			return fail('a 7-file batch auto-opened a preview');
+		}
+		if (previewSvg(win)) {
+			return fail('preview rendered for a 7-file batch');
+		}
+
+		log('7-file batch: tabs + labels + no auto-preview');
+		runBatch(win, 6, 'F08', function () {
+			checkPicker(win);
+		});
+	}
+
+	function checkPicker(win) {
+		var picker = win.document.querySelector('#importpicker');
+		if (!picker) {
+			return fail('picker missing for 13 imports');
+		}
+		if (win.document.querySelector('#importsnav')) {
+			return fail('tab strip still shown for 13 imports');
+		}
+		var select = picker.querySelector('select');
+		if (!select) {
+			return fail('picker select missing');
+		}
+		if (select.options.length !== 14) {
+			return fail('expected 14 options (placeholder + 13), got ' + select.options.length);
+		}
+		if (select.options[1].textContent.indexOf('F01') < 0 ||
+			select.options[13].textContent.indexOf('F13') < 0) {
+			return fail('picker options do not show part marks');
+		}
+
+		var selected = win.DeepNest.imports.filter(function (im) { return im.selected; });
+		if (selected.length !== 0) {
+			return fail('a 13-file batch auto-opened a preview');
+		}
+		if (previewSvg(win)) {
+			return fail('preview rendered before a picker selection');
+		}
+
+		picker.querySelector('.next').click();
+
+		var attempts = 0;
+		var poll = setInterval(function () {
+			attempts++;
+			var svg = previewSvg(win);
+			if (svg) {
+				clearInterval(poll);
+				var label = svg.querySelector('text.part-label');
+				if (!label || label.textContent.indexOf('F01') < 0) {
+					return fail('preview label missing after picker navigation');
+				}
+				log('picker: no auto-preview, next opens F01 with on-canvas label');
+				clearTimeout(globalTimeout);
+				finish('PASS');
+				return;
+			}
+			if (attempts > 300) {
+				clearInterval(poll);
+				fail('picker did not render a preview');
+			}
+		}, 100);
+	}
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,245 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Deepnest browser end-to-end</title></head>
+<body data-e2e="RUNNING"><pre id="log"></pre>
+<script>
+(function () {
+	var logElement = document.getElementById('log');
+	var finished = false;
+
+	function log(message) {
+		logElement.textContent += message + '\n';
+	}
+
+	function finish(result) {
+		if (finished) {
+			return;
+		}
+		finished = true;
+		document.body.setAttribute('data-e2e', result);
+		log(result);
+	}
+
+	window.onerror = function (message, source, line) {
+		finish('FAIL: ' + message + ' @ ' + source + ':' + line);
+	};
+
+	var globalTimeout = setTimeout(function () {
+		if (!finished) {
+			finish('FAIL: overall timeout');
+		}
+	}, 90000);
+
+	var dxf = [
+		'0', 'SECTION', '2', 'HEADER',
+		'9', '$ACADVER', '1', 'AC1009',
+		'9', '$INSUNITS', '70', '4',
+		'0', 'ENDSEC',
+		'0', 'SECTION', '2', 'TABLES',
+		'0', 'TABLE', '2', 'LAYER', '70', '2',
+		'0', 'LAYER', '2', '0', '70', '0', '62', '7', '6', 'CONTINUOUS',
+		'0', 'LAYER', '2', 'TEXT', '70', '0', '62', '7', '6', 'CONTINUOUS',
+		'0', 'ENDTAB',
+		'0', 'ENDSEC',
+		'0', 'SECTION', '2', 'ENTITIES',
+		'0', 'POLYLINE', '8', '0', '66', '1', '10', '0', '20', '0', '30', '0', '70', '1',
+		'0', 'VERTEX', '8', '0', '10', '0', '20', '0', '30', '0',
+		'0', 'VERTEX', '8', '0', '10', '100', '20', '0', '30', '0',
+		'0', 'VERTEX', '8', '0', '10', '100', '20', '100', '30', '0',
+		'0', 'VERTEX', '8', '0', '10', '0', '20', '100', '30', '0',
+		'0', 'SEQEND',
+		'0', 'TEXT', '8', 'TEXT', '62', '7', '10', '10', '20', '90', '40', '5', '1', '[N]TEST-PL-0001',
+		'0', 'TEXT', '8', 'TEXT', '62', '7', '10', '10', '20', '80', '40', '5', '1', '[Q]2',
+		'0', 'ENDSEC',
+		'0', 'EOF'
+	].join('\n');
+
+	function sheetSvg() {
+		return '<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="100mm" viewBox="0 0 100 100">' +
+			'<rect x="0" y="0" width="100" height="100"/></svg>';
+	}
+
+	var frame = document.createElement('iframe');
+	frame.style.width = '1200px';
+	frame.style.height = '800px';
+	frame.style.display = 'none';
+	frame.src = '/main/index.html';
+	document.body.appendChild(frame);
+
+	frame.onload = function () {
+		var win = frame.contentWindow;
+		var attempts = 0;
+		var waitForApp = setInterval(function () {
+			attempts++;
+			if (!win.DeepNest || !win.document.querySelector('#import') || !win.__browserShim) {
+				if (attempts > 300) {
+					clearInterval(waitForApp);
+					finish('FAIL: app did not initialize');
+				}
+				return;
+			}
+			clearInterval(waitForApp);
+			run(win);
+		}, 50);
+	};
+
+	function run(win) {
+		try {
+			if (/[?&]noworker=1(?:&|$)/.test(window.location.search)) {
+				win.__deepnestDisableImportWorkers = true;
+			}
+			win.addEventListener('error', function (event) {
+				log('iframe error: ' + event.message + ' @ ' + event.filename + ':' + event.lineno);
+			});
+			win.addEventListener('unhandledrejection', function (event) {
+				log('iframe rejection: ' + (event.reason && event.reason.message || event.reason));
+			});
+			var originalPost = win.__browserShim.request.post;
+			win.__browserShim.request.post = function (url, callback) {
+				log('conversion request started');
+				return originalPost(url, function (error, response, body) {
+					log('conversion callback err=' + (error && error.message) + ' bytes=' + (body && body.length) + ' body=' + String(body).slice(0, 200));
+					callback(error, response, body);
+				});
+			};
+
+			var file = new win.File([dxf], 'TEST-PL-0001.dxf', { type: 'application/dxf' });
+			var fakePath = win.__browserShim.registerFile(file);
+			var electron = win.require('electron');
+			electron.remote.dialog.showOpenDialog = function (options, callback) {
+				callback([fakePath]);
+			};
+
+			win.document.querySelector('#import').click();
+
+			var attempts = 0;
+			var waitForImport = setInterval(function () {
+				attempts++;
+				if (win.DeepNest.parts.length > 0) {
+					clearInterval(waitForImport);
+					var part = win.DeepNest.parts[0];
+					log('imported mark=' + part.mark + ' qty=' + part.quantity);
+					if (part.mark !== 'TEST-PL-0001') {
+						finish('FAIL: DXF mark was not imported');
+						return;
+					}
+					if (part.quantity !== 2) {
+						finish('FAIL: DXF quantity was not imported');
+						return;
+					}
+					afterImport(win);
+					return;
+				}
+				if (attempts > 600) {
+					clearInterval(waitForImport);
+					finish('FAIL: DXF import did not finish (imports=' + win.DeepNest.imports.length +
+						' parts=' + win.DeepNest.parts.length +
+						' msg=' + (win.document.querySelector('#messagecontent').textContent || '') +
+						' errors=' + JSON.stringify(win.__deepnestImportErrors || []).slice(0, 600) + ')');
+				}
+			}, 100);
+		} catch (error) {
+			finish('FAIL: ' + error.message);
+		}
+	}
+
+	function afterImport(win) {
+		win.DeepNest.importsvg('sheet.svg', null, sheetSvg(), null, false, { mark: 'SHEET' });
+
+		for (var i = 0; i < win.DeepNest.parts.length; i++) {
+			if (win.DeepNest.parts[i].mark === 'SHEET') {
+				win.DeepNest.parts[i].sheet = true;
+			}
+		}
+
+		win.__browserShim.fs.writeFileSync = function (name, data) {
+			win.__lastExport = { name: name, data: data };
+		};
+
+		win.document.querySelector('#startnest').click();
+
+		var attempts = 0;
+		var waitForNest = setInterval(function () {
+			attempts++;
+			if (win.DeepNest.nests.length > 0) {
+				clearInterval(waitForNest);
+				win.DeepNest.nests.forEach(function (nest) {
+					nest.selected = false;
+				});
+				win.DeepNest.nests[0].selected = true;
+				exportDxf(win);
+				return;
+			}
+			if (attempts > 600) {
+				clearInterval(waitForNest);
+				finish('FAIL: nesting did not finish');
+			}
+		}, 100);
+	}
+
+	function exportDxf(win) {
+		var exportButton = win.document.querySelector('#exportdxf');
+		if (!exportButton) {
+			finish('FAIL: DXF export button not found');
+			return;
+		}
+
+		log('export click type=' + typeof exportButton.onclick + ' selected=' + win.DeepNest.nests[0].selected);
+		exportButton.click();
+
+		var attempts = 0;
+		var waitForExport = setInterval(function () {
+			attempts++;
+			if (win.__lastExport && win.__lastExport.data) {
+				clearInterval(waitForExport);
+				var output = String(win.__lastExport.data).replace(/\r\n/g, '\n');
+				var textCount = (output.match(/\n0\nTEXT\n/g) || []).length;
+				var placedCount = 0;
+				win.DeepNest.nests[0].placements.forEach(function (placement) {
+					placedCount += placement.sheetplacements.length;
+				});
+				log('exported ' + win.__lastExport.name + ' bytes=' + output.length);
+				log('TEXT entities=' + textCount + ' placed=' + placedCount);
+
+				var lines = output.split('\n');
+				var values = [];
+				for (var li = 0; li + 1 < lines.length; li++) {
+					if (lines[li].trim() === '0' && lines[li + 1].trim() === 'TEXT') {
+						for (var lj = li + 2; lj + 1 < Math.min(li + 30, lines.length); lj++) {
+							if (lines[lj].trim() === '1') {
+								values.push(lines[lj + 1]);
+								break;
+							}
+						}
+					}
+				}
+				log('TEXT values=' + JSON.stringify(values));
+
+				if (output.indexOf('TEST-PL-0001') < 0) {
+					finish('FAIL: part mark missing from exported DXF');
+					return;
+				}
+				if (textCount !== placedCount) {
+					finish('FAIL: expected one TEXT per placed part (' + placedCount + '), got ' + textCount);
+					return;
+				}
+				for (var vi = 0; vi < values.length; vi++) {
+					if (values[vi] !== 'TEST-PL-0001') {
+						finish('FAIL: unexpected TEXT value ' + JSON.stringify(values[vi]));
+						return;
+					}
+				}
+				clearTimeout(globalTimeout);
+				finish('PASS');
+				return;
+			}
+			if (attempts > 600) {
+				clearInterval(waitForExport);
+				finish('FAIL: DXF export did not finish');
+			}
+		}, 100);
+	}
+})();
+</script>
+</body>
+</html>

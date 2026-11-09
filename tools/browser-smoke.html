@@ -1,0 +1,154 @@
+<!doctype html>
+<html>
+<head>
+	<meta charset="utf-8">
+	<title>Deepnest browser smoke test</title>
+	<script src="/main/util/pathsegpolyfill.js"></script>
+	<script src="/main/util/matrix.js"></script>
+	<script src="/main/util/clipper.js"></script>
+	<script src="/main/util/parallel.js"></script>
+	<script src="/main/util/geometryutil.js"></script>
+	<script src="/main/util/placementworker.js"></script>
+	<script src="/main/util/d3-polygon.js"></script>
+	<script src="/main/util/simplify.js"></script>
+	<script src="/main/svgparser.js"></script>
+	<script src="/main/deepnest.js"></script>
+	<script src="/main/importer/dxf-meta.js"></script>
+	<script src="/main/importer/nc1.js"></script>
+	<script src="/main/exporter/dxf-labels.js"></script>
+</head>
+<body data-smoke="RUNNING">
+	<h1>Deepnest browser smoke test</h1>
+	<pre id="log"></pre>
+	<script>
+	(function () {
+		var logElement = document.getElementById('log');
+		var finished = false;
+
+		function log(message) {
+			logElement.textContent += message + '\n';
+		}
+
+		function finish(result) {
+			if (finished) {
+				return;
+			}
+			finished = true;
+			document.body.setAttribute('data-smoke', result);
+			log(result);
+		}
+
+		window.onerror = function (message, source, line) {
+			finish('FAIL: ' + message + ' @ ' + source + ':' + line);
+		};
+
+		function rectSvg(width, height, parts) {
+			var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="' + width + 'mm" height="' + height + 'mm" viewBox="0 0 ' + width + ' ' + height + '">';
+			for (var i = 0; i < parts.length; i++) {
+				var part = parts[i];
+				svg += '<rect x="' + part.x + '" y="' + part.y + '" width="' + part.width + '" height="' + part.height + '"/>';
+			}
+			svg += '</svg>';
+			return svg;
+		}
+
+		try {
+			var nc1Text = [
+				'ST', '** TEST.nc1', '  PROJECT', '  LOT', '  PHASE',
+				'  TEST-PL-0001', '  S355 (5)', '  2', '  PL8*100', 'B',
+				'AK', '  v 0 0', '  100 0', '  100 50', '  0 50', '  0 0',
+				'IK', '  v 10 10', '  20 10', '  20 20', '  10 20', '  10 10',
+				'BO', '  v 50 25 10 0', 'EN'
+			].join('\n');
+			var nc1Part = Nc1.parseNc1(nc1Text, 'TEST.nc1');
+			var nc1Svg = Nc1.nc1ToSvg(nc1Part, { curveTolerance: 0.1 });
+			if (nc1Part.mark !== 'TEST-PL-0001' || nc1Part.header.quantity !== 2 || nc1Svg.contourCount !== 3) {
+				finish('FAIL: NC1 metadata/SVG check');
+				return;
+			}
+			log('nc1 mark=' + nc1Part.mark + ' qty=' + nc1Part.header.quantity + ' paths=' + nc1Svg.contourCount);
+
+			var dxfMetaText = [
+				'0', 'SECTION', '2', 'ENTITIES',
+				'0', 'TEXT', '8', 'TEXT', '62', '7', '10', '2', '20', '40', '40', '5',
+				'1', '[N]TEST-PL-0001',
+				'0', 'TEXT', '8', 'TEXT', '62', '7', '10', '2', '20', '35', '40', '5',
+				'1', '[Q]2',
+				'0', 'ENDSEC', '0', 'EOF'
+			].join('\n');
+			var dxfMeta = DxfMeta.parseDxfMeta(dxfMetaText);
+			if (dxfMeta.mark !== 'TEST-PL-0001' || dxfMeta.quantity !== 2) {
+				finish('FAIL: DXF metadata check');
+				return;
+			}
+			log('dxf mark=' + dxfMeta.mark + ' qty=' + dxfMeta.quantity);
+
+			DeepNest.config({
+				clipperScale: 10000000,
+				curveTolerance: 0.3,
+				spacing: 0,
+				rotations: 4,
+				populationSize: 3,
+				mutationRate: 10,
+				threads: 1,
+				placementType: 'gravity',
+				mergeLines: false,
+				timeRatio: 0.5,
+				scale: 72,
+				simplify: false,
+				endpointTolerance: 0.36
+			});
+
+			// One sheet and one part with quantity 2.
+			DeepNest.importsvg('sheet.svg', null, rectSvg(100, 100, [
+				{ x: 0, y: 0, width: 100, height: 100 }
+			]), null, false, { mark: 'SHEET' });
+			DeepNest.parts[0].sheet = true;
+
+			DeepNest.importsvg('part.svg', null, rectSvg(100, 100, [
+				{ x: 0, y: 0, width: 20, height: 20 }
+			]), null, false, { mark: 'P-001', quantity: 2 });
+
+			log('parts=' + DeepNest.parts.length + ' mark=' + DeepNest.parts[1].mark + ' qty=' + DeepNest.parts[1].quantity);
+
+			if (DeepNest.parts[1].quantity !== 2) {
+				finish('FAIL: quantity metadata was not applied');
+				return;
+			}
+
+			DeepNest.start(null, function () {
+				log('placement callback, nests=' + DeepNest.nests.length);
+			});
+
+			var waited = 0;
+			var timer = setInterval(function () {
+				waited += 250;
+				if (DeepNest.nests.length > 0) {
+					clearInterval(timer);
+					DeepNest.stop();
+					var nest = DeepNest.nests[0];
+					var placed = 0;
+					for (var i = 0; i < nest.placements.length; i++) {
+						placed += nest.placements[i].sheetplacements.length;
+					}
+					log('nests=' + DeepNest.nests.length + ' placed=' + placed);
+					if (placed >= 2) {
+						finish('PASS');
+					} else {
+						finish('FAIL: expected 2 placements, got ' + placed);
+					}
+					return;
+				}
+				if (waited >= 15000) {
+					clearInterval(timer);
+					DeepNest.stop();
+					finish('FAIL: nesting did not produce a result within 15s');
+				}
+			}, 250);
+		} catch (error) {
+			finish('FAIL: ' + error.message);
+		}
+	})();
+	</script>
+</body>
+</html>

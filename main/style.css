@@ -763,6 +763,9 @@ margin: 0;
 padding: 0;
 cursor: default;
 background-color: #CDD8E0;
+overflow-x: auto;
+overflow-y: hidden;
+white-space: nowrap;
 }
 
 #importsnav li{
@@ -772,7 +775,9 @@ padding: 0 0.75em 0 1.5em;
 height: 2.3em;
 line-height: 2.3em;
 background-color: #E4E8ED;
-float: left;
+display: inline-block;
+float: none;
+vertical-align: top;
 border-bottom: none;
 }
 
@@ -902,6 +907,110 @@ stroke-width: 2px !important;
 
 #imports svg *.error{
 stroke: #f00 !important;
+}
+
+/* Part names drawn on the preview. Overrides the generic
+   "#imports svg *" fill/stroke rule above. */
+#imports svg text.part-label{
+fill: #404247 !important;
+fill-opacity: 1 !important;
+stroke: none !important;
+font-family: Lato, sans-serif;
+pointer-events: none;
+}
+
+#previewhost{
+width: 100%;
+height: 100%;
+display: block;
+}
+
+#previewhint{
+position: absolute;
+top: 50%;
+left: 50%;
+transform: translate(-50%, -50%);
+color: #7c8a94;
+font-size: 1.05em;
+display: none;
+pointer-events: none;
+white-space: nowrap;
+}
+
+#importpicker{
+position: absolute;
+width: 100%;
+height: 2.7em;
+top: calc(var(--nav-width) - 0.625em);
+left: 0;
+background-color: #CDD8E0;
+padding: 0.4em 0.8em;
+box-sizing: border-box;
+}
+
+#importpicker select{
+position: absolute;
+top: 0.4em;
+left: 3.2em;
+width: calc(100% - 6.4em);
+height: 2.3em;
+border: none;
+border-radius: 4px;
+background-color: #E4E8ED;
+padding: 0 0.6em;
+}
+
+#importpicker .prev,
+#importpicker .next{
+position: absolute;
+top: 0.4em;
+width: 2.3em;
+height: 2.3em;
+background-color: #E4E8ED;
+border-radius: 4px;
+background-position: 50%;
+background-size: 1em 1em;
+background-repeat: no-repeat;
+}
+
+#importpicker .prev{
+left: 0.8em;
+background-image: url(img/arrow_right.svg);
+transform: rotate(180deg);
+}
+
+#importpicker .next{
+right: 0.8em;
+background-image: url(img/arrow_right.svg);
+}
+
+#importpicker .prev:hover,
+#importpicker .next:hover{
+background-color: #B8C3C9;
+}
+
+.importstatus{
+float: left;
+margin: 0.9em 0 0 1.25em;
+height: 2.6em;
+line-height: 2.6em;
+color: #404247;
+font-size: 0.95em;
+}
+
+.button.importcancel{
+float: left;
+margin-left: 0.8em;
+background-color: #E4E8ED;
+color: #404247;
+}
+
+.thumb-placeholder{
+display: inline-block;
+width: 48px;
+height: 48px;
+background-color: #E4E8ED;
+border-radius: 3px;
 }
 
 #bins svg{
